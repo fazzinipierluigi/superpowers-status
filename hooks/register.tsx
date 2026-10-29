@@ -3,7 +3,7 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { Attivita, Avvio, Composer, FileTracciato, Fonte, InfoAgente, Piano, TaskLibero, TaskPiano, Tempi, Todo } from '../types'
 import {
-  aggiornaTempi, applicaRegistro, chiaveDi, durata, faseAttiva, finePiano, fineTask, haCheckbox, percPiano, percTask,
+  aggiornaTempi, applicaRegistro, basiRegistro, chiaveDi, durata, faseAttiva, finePiano, fineTask, haCheckbox, inBase, percPiano, percTask,
   pianoDaTask, pianoDaTodo, pianoDalRegistro, potaTempi, ritmo, stimaTask, taskDaMarkdown, taskDalPiano, titoloMarkdown,
 } from './parse'
 import { percorsoPiano, promptInterno, promptSuperpowers, superpowersDisponibile } from './avvio'
@@ -142,20 +142,28 @@ const gauge = (pct: number, w: number) => {
 }
 
 async function leggiPiani($: EngineInterface): Promise<Piano[]> {
-  if (!(await $.fs.exists(SDD))) return []
   const limite = Date.now() - GIORNI_RECENTI * 86400000
-  const cartelle = (await $.fs.list(SDD)).filter(c => c.kind === 'dir')
-  const conRegistro: { nome: string; mtime: number }[] = []
-  for (const c of cartelle) {
-    const st = await $.fs.stat(`${SDD}/${c.name}/progress.md`).catch(() => undefined)
-    if (st && st.mtimeMs >= limite) conRegistro.push({ nome: c.name, mtime: st.mtimeMs })
+  const repo = await $.session.repo().catch(() => null)
+  const basi = basiRegistro(await $.session.cwd(), repo?.root)
+  const conRegistro: { nome: string; base: string; mtime: number }[] = []
+  for (const base of basi) {
+    const sdd = inBase(base, SDD)
+    if (!(await $.fs.exists(sdd))) continue
+    for (const c of (await $.fs.list(sdd)).filter(c => c.kind === 'dir')) {
+      // Lo stesso registro visto dalla cwd e dalla root del repo si conta una volta.
+      if (conRegistro.some(r => r.nome === c.name)) continue
+      const st = await $.fs.stat(`${sdd}/${c.name}/progress.md`).catch(() => undefined)
+      if (st && st.mtimeMs >= limite) conRegistro.push({ nome: c.name, base, mtime: st.mtimeMs })
+    }
   }
   conRegistro.sort((a, b) => b.mtime - a.mtime)
   const out: Piano[] = []
-  for (const { nome } of conRegistro.slice(0, MAX_PIANI)) {
-    const registro = await $.fs.read(`${SDD}/${nome}/progress.md`).catch(() => '')
-    const percorso = pianoDalRegistro(registro)
-    if (!percorso) continue
+  for (const { nome, base } of conRegistro.slice(0, MAX_PIANI)) {
+    const registro = await $.fs.read(`${inBase(base, SDD)}/${nome}/progress.md`).catch(() => '')
+    const relativo = pianoDalRegistro(registro)
+    if (!relativo) continue
+    // Il piano si legge prima dalla cwd (il worktree dove si lavora), poi accanto al registro.
+    const percorso = (await $.fs.exists(relativo)) ? relativo : inBase(base, relativo)
     const testo = await $.fs.read(percorso).catch(() => '')
     const task = applicaRegistro(taskDalPiano(testo), registro)
     if (task.length) out.push({ nome, task, fonte: 'superpowers', titolo: nome, percorso } as Piano & { percorso: string })

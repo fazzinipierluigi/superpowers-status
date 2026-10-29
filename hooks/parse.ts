@@ -11,6 +11,21 @@ export function pianoDalRegistro(registro: string): string | undefined {
   return m?.[1]
 }
 
+/**
+ * Cartelle in cui cercare il registro: la cwd della sessione ("") e, se la sessione è in un
+ * worktree, la root del repository principale, dove resta .superpowers (ignorato da git).
+ */
+export function basiRegistro(cwd: string, repo: string | undefined): string[] {
+  const n = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  return repo && n(repo) !== n(cwd) ? ['', n(repo)] : ['']
+}
+
+/** Un percorso relativo a una base ("" = cwd); un percorso assoluto resta com'è. */
+export function inBase(base: string, percorso: string): string {
+  if (!base || /^([\\/]|[A-Za-z]:[\\/])/.test(percorso)) return percorso
+  return `${base}/${percorso}`
+}
+
 /** Task del piano ("### Task N: titolo") con i loro passi ("- [ ]" / "- [x]"). */
 export function taskDalPiano(piano: string): TaskPiano[] {
   const out: TaskPiano[] = []
