@@ -1,0 +1,5 @@
+{
+  "name": "superpowers-status",
+  "owner": { "name": "Fazzini Pierluigi", "url": "https://github.com/fazzinipierluigi" },
+  "plugins": [{ "name": "superpowers-status", "source": "./" }]
+}
