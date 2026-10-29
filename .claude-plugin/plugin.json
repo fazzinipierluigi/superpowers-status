@@ -1,6 +1,6 @@
 {
   "name": "superpowers-status",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Live side panel for Claude Code that tracks your project's development: superpowers SDD plans, plan-mode and markdown checklists, tasks and to-dos, with animated progress, per-task and per-plan ETA, subagent activity and a button to start a new work plan",
   "author": {
     "name": "Fazzini Pierluigi",
