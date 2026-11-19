@@ -1,12 +1,19 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { Attivita, Avvio, Composer, FileTracciato, Fonte, InfoAgente, Piano, TaskLibero, TaskPiano, Tempi, Todo } from '../types'
+import type { Attivita, Avvio, Composer, FileTracciato, Fonte, InfoAgente, Lang, Piano, TaskLibero, TaskPiano, Tempi, Todo } from '../types'
 import {
-  aggiornaTempi, applicaRegistro, basiRegistro, chiaveDi, durata, faseAttiva, finePiano, fineTask, haCheckbox, inBase, percPiano, percTask,
-  pianoDaTask, pianoDaTodo, pianoDalRegistro, potaTempi, ritmo, stimaTask, taskDaMarkdown, taskDalPiano, titoloMarkdown,
+  updateTimings, applyLedger, ledgerBases, timingKey, measuredDuration, isActivePhase, planEnd, taskEnd, hasCheckboxes, resolveIn, planPercent, taskPercent,
+  planFromTasks, planFromTodos, planFromLedger, pruneTimings, stepPace, estimateTask, tasksFromMarkdown, tasksFromPlan, markdownTitle,
 } from './parse'
-import { percorsoPiano, promptInterno, promptSuperpowers, superpowersDisponibile } from './avvio'
+import {
+  TOOL_DESCRIPTION, TOOL_NAME, TOOL_SCHEMA, PLAN_SECTION, subagentDirective, planPath, internalPrompt, superpowersPrompt,
+  isSuperpowersAvailable,
+} from './avvio'
+import { FALLBACK, langFromName, phaseKey, translate, translator } from './i18n'
+import type { MessageKey } from './i18n'
+import { applyOperations, planStatus } from './spunta'
+import type { Operation } from './spunta'
 
 const PANE = 'superpowers-status'
 const TITOLO = 'Superpowers status'
@@ -20,7 +27,7 @@ const MAX_STORICO = 20
 const MAX_FILE = 5
 
 // Cambia il tag quando cambia la forma: rifiuta i valori salvati da una versione precedente.
-const piani = atom({ plugin: 'superpowers-status', key: 'piani' } as const, [] as Piano[], { shape: 'piani-1' })
+const piani = atom({ plugin: 'superpowers-status', key: 'piani' } as const, [] as Piano[], { shape: 'piani-2' })
 const agenti = atom({ plugin: 'superpowers-status', key: 'agenti' } as const, [] as InfoAgente[], { shape: 'agenti-1' })
 const attivita = atom({ plugin: 'superpowers-status', key: 'attivita' } as const, {} as Record<string, Attivita>, { shape: 'attivita-1' })
 const todo = atom({ plugin: 'superpowers-status', key: 'todo' } as const, [] as Todo[], { shape: 'todo-1' })
@@ -36,11 +43,54 @@ const espansi = atom({ plugin: 'superpowers-status', key: 'espansi' } as const, 
 const MAX_ATTESA_AVVIO = 30 * 60 * 1000
 const ATTESA_FILE_MS = 60 * 60 * 1000
 const mostraNascosti = atom({ plugin: 'superpowers-status', key: 'mostraNascosti' } as const, false, { shape: 'mostra-1' })
+const lingua = atom({ plugin: 'superpowers-status', key: 'lang' } as const, FALLBACK as Lang, { shape: 'lang-1' })
+
+// ---------------------------------------------------------------- lingua
+
+/** Testo nella lingua del pannello, per ciò che non si disegna (comandi, toast). */
+const tr = async ($: EngineInterface, key: MessageKey, vars?: Record<string, string | number>) =>
+  translate(await read($, lingua), key, vars)
+
+/** Il campo `language` di un settings.json, se il file c'è. */
+async function settingsLanguage($: EngineInterface, path: string): Promise<unknown> {
+  const text = await $.fs.read(path).catch(() => '')
+  if (!text) return undefined
+  try { return (JSON.parse(text) as { language?: unknown }).language } catch { return undefined }
+}
+
+/**
+ * Lingua delle etichette: l'opzione `language` della mod; in `auto`, l'impostazione `language` di
+ * Claude Code (menu /config, poi i settings.json del progetto e dell'utente), poi la lingua del sistema.
+ */
+async function resolveLang($: EngineInterface, preference: unknown): Promise<Lang> {
+  const chosen = preference === 'auto' ? undefined : langFromName(preference)
+  if (chosen) return chosen
+  try {
+    const row = (await $.config.list()).find(r => /^(language|lang|locale)$/i.test(r.key))
+    const l = langFromName(row?.value)
+    if (l) return l
+  } catch { /* menu non disponibile */ }
+  const none = () => undefined
+  const home = (await $.env.get('USERPROFILE').catch(none)) ?? (await $.env.get('HOME').catch(none))
+  const configDir = (await $.env.get('CLAUDE_CONFIG_DIR').catch(none)) ?? (home ? `${home.replace(/[\\/]+$/, '')}/.claude` : undefined)
+  const settings = ['.claude/settings.local.json', '.claude/settings.json', ...(configDir ? [`${configDir}/settings.json`] : [])]
+  for (const path of settings) {
+    const l = langFromName(await settingsLanguage($, path))
+    if (l) return l
+  }
+  const locale = [
+    await $.env.get('LC_ALL').catch(none),
+    await $.env.get('LC_MESSAGES').catch(none),
+    await $.env.get('LANG').catch(none),
+    await $.env.get('LANGUAGE').catch(none),
+  ]
+  return locale.map(langFromName).find(Boolean) ?? FALLBACK
+}
 
 // I piani nascosti valgono anche nelle sessioni dopo: stanno in $.store, l'atom ne è la copia che ridisegna.
 const CHIAVE_NASCOSTI = 'nascosti'
 
-async function caricaNascosti($: EngineInterface) {
+async function loadHidden($: EngineInterface) {
   const v = await $.store.get(CHIAVE_NASCOSTI).catch(() => undefined)
   const lista = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
   await update($, nascosti, () => lista)
@@ -49,7 +99,7 @@ async function caricaNascosti($: EngineInterface) {
 // Tempi dei task per le ETA: in $.store perché lo storico delle sessioni passate affina la stima.
 const CHIAVE_TEMPI = 'tempi'
 
-async function caricaTempi($: EngineInterface) {
+async function loadTimings($: EngineInterface) {
   const v = await $.store.get(CHIAVE_TEMPI).catch(() => undefined)
   const t = v && typeof v === 'object' && !Array.isArray(v) ? (v as Tempi) : {}
   await update($, tempi, () => t)
@@ -58,41 +108,41 @@ async function caricaTempi($: EngineInterface) {
 // File markdown con checkbox scritti o modificati in sessione (o salvati dal plan mode): seguiti come piani.
 // $.store è uno solo per tutti i progetti: la lista sta sotto una chiave per progetto, così una sessione
 // non mostra i piani di un'altra che lavora altrove. Non si filtra per cartella: il plan mode salva fuori dal progetto.
-const CHIAVE_FILE_GLOBALE = 'fileTracciati'
+const CHIAVE_FILE_GLOBALE = 'trackedFiles'
 
-const normale = (p: string) => p.replace(/\\/g, '/').toLowerCase()
+const normalizePath = (p: string) => p.replace(/\\/g, '/').toLowerCase()
 
-const chiaveFile = async ($: EngineInterface) => `fileTracciati:${normale(await $.session.root())}`
+const trackedFilesKey = async ($: EngineInterface) => `trackedFiles:${normalizePath(await $.session.root())}`
 
-async function fileTracciati($: EngineInterface): Promise<FileTracciato[]> {
-  const v = await $.store.get(await chiaveFile($)).catch(() => undefined)
+async function trackedFiles($: EngineInterface): Promise<FileTracciato[]> {
+  const v = await $.store.get(await trackedFilesKey($)).catch(() => undefined)
   return Array.isArray(v) ? v.filter((x): x is FileTracciato => !!x && typeof (x as FileTracciato).percorso === 'string') : []
 }
 
-async function salvaTracciati($: EngineInterface, lista: FileTracciato[]) {
-  await $.store.set(await chiaveFile($), lista)
+async function saveTrackedFiles($: EngineInterface, lista: FileTracciato[]) {
+  await $.store.set(await trackedFilesKey($), lista)
 }
 
 /** La lista di prima, comune a tutti i progetti, non si può dividere: la si scarta una volta. */
-async function scartaListaGlobale($: EngineInterface) {
+async function dropGlobalList($: EngineInterface) {
   const chiavi = await $.store.keys().catch((): string[] => [])
   if (chiavi.includes(CHIAVE_FILE_GLOBALE)) await $.store.delete(CHIAVE_FILE_GLOBALE)
 }
 
-async function traccia($: EngineInterface, percorso: string) {
-  const n = normale(percorso)
-  const lista = (await fileTracciati($)).filter(f => {
-    const m = normale(f.percorso)
+async function trackFile($: EngineInterface, percorso: string) {
+  const n = normalizePath(percorso)
+  const lista = (await trackedFiles($)).filter(f => {
+    const m = normalizePath(f.percorso)
     return !(m === n || m.endsWith('/' + n) || n.endsWith('/' + m))
   })
-  await salvaTracciati($, [{ percorso, visto: Date.now() }, ...lista].slice(0, MAX_FILE))
+  await saveTrackedFiles($, [{ percorso, visto: Date.now() }, ...lista].slice(0, MAX_FILE))
 }
 
 // Id della sessione, per tenere separati i tempi di task e to-do di sessioni diverse.
 let sessione = ''
-const idSessione = async ($: EngineInterface) => (sessione ||= (await $.session.id().catch(() => 'sessione')).slice(0, 8))
+const sessionId = async ($: EngineInterface) => (sessione ||= (await $.session.id().catch(() => 'sessione')).slice(0, 8))
 
-async function impostaNascosti($: EngineInterface, fn: (l: string[]) => string[]) {
+async function setHidden($: EngineInterface, fn: (l: string[]) => string[]) {
   const lista = fn(await read($, nascosti))
   await update($, nascosti, () => lista)
   await $.store.set(CHIAVE_NASCOSTI, lista)
@@ -121,33 +171,33 @@ const COLORE_FASE: Record<string, string> = {
   'in coda': C.dim,
 }
 
-const minuti = (ms: number) => (ms < 60000 ? Math.round(ms / 1000) + ' s' : Math.round(ms / 60000) + ' min')
+const formatMinutes = (ms: number) => (ms < 60000 ? Math.round(ms / 1000) + ' s' : Math.round(ms / 60000) + ' min')
 
-const durataBreve = (ms: number) => {
+const shortDuration = (ms: number) => {
   const m = Math.round(ms / 60000)
   if (m < 1) return `${Math.max(1, Math.round(ms / 1000))} s`
   return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')}`
 }
 
-const orario = (t: number) => {
+const clockTime = (t: number) => {
   const d = new Date(t)
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-const corto = (s: string, n: number) => (n <= 0 ? '' : s.length > n ? s.slice(0, Math.max(0, n - 1)).trimEnd() + '…' : s)
+const truncate = (s: string, n: number) => (n <= 0 ? '' : s.length > n ? s.slice(0, Math.max(0, n - 1)).trimEnd() + '…' : s)
 
 const gauge = (pct: number, w: number) => {
   const n = Math.max(0, Math.min(w, Math.round((pct / 100) * w)))
   return { on: '▰'.repeat(n), off: '▱'.repeat(w - n) }
 }
 
-async function leggiPiani($: EngineInterface): Promise<Piano[]> {
+async function readPlans($: EngineInterface): Promise<Piano[]> {
   const limite = Date.now() - GIORNI_RECENTI * 86400000
   const repo = await $.session.repo().catch(() => null)
-  const basi = basiRegistro(await $.session.cwd(), repo?.root)
+  const basi = ledgerBases(await $.session.cwd(), repo?.root)
   const conRegistro: { nome: string; base: string; mtime: number }[] = []
   for (const base of basi) {
-    const sdd = inBase(base, SDD)
+    const sdd = resolveIn(base, SDD)
     if (!(await $.fs.exists(sdd))) continue
     for (const c of (await $.fs.list(sdd)).filter(c => c.kind === 'dir')) {
       // Lo stesso registro visto dalla cwd e dalla root del repo si conta una volta.
@@ -159,25 +209,25 @@ async function leggiPiani($: EngineInterface): Promise<Piano[]> {
   conRegistro.sort((a, b) => b.mtime - a.mtime)
   const out: Piano[] = []
   for (const { nome, base } of conRegistro.slice(0, MAX_PIANI)) {
-    const registro = await $.fs.read(`${inBase(base, SDD)}/${nome}/progress.md`).catch(() => '')
-    const relativo = pianoDalRegistro(registro)
+    const registro = await $.fs.read(`${resolveIn(base, SDD)}/${nome}/progress.md`).catch(() => '')
+    const relativo = planFromLedger(registro)
     if (!relativo) continue
     // Il piano si legge prima dalla cwd (il worktree dove si lavora), poi accanto al registro.
-    const percorso = (await $.fs.exists(relativo)) ? relativo : inBase(base, relativo)
+    const percorso = (await $.fs.exists(relativo)) ? relativo : resolveIn(base, relativo)
     const testo = await $.fs.read(percorso).catch(() => '')
-    const task = applicaRegistro(taskDalPiano(testo), registro)
-    if (task.length) out.push({ nome, task, fonte: 'superpowers', titolo: nome, percorso } as Piano & { percorso: string })
+    const task = applyLedger(tasksFromPlan(testo), registro)
+    if (task.length) out.push({ nome, task, fonte: 'superpowers', titolo: nome, percorso })
   }
   return out
 }
 
 /** Lavoro fuori da superpowers: file markdown seguiti, lista task di Claude Code, to-do. */
-async function leggiLiberi($: EngineInterface, giaMostrati: string[]): Promise<Piano[]> {
+async function readOtherPlans($: EngineInterface, giaMostrati: string[]): Promise<Piano[]> {
   const out: Piano[] = []
   const limite = Date.now() - GIORNI_RECENTI * 86400000
   const tenuti: FileTracciato[] = []
-  const esclusi = giaMostrati.map(normale)
-  for (const f of await fileTracciati($)) {
+  const esclusi = giaMostrati.map(normalizePath)
+  for (const f of await trackedFiles($)) {
     const st = await $.fs.stat(f.percorso).catch(() => undefined)
     // Un piano chiesto dal pannello non esiste ancora: lo si aspetta per un po'.
     if (!st) {
@@ -187,36 +237,36 @@ async function leggiLiberi($: EngineInterface, giaMostrati: string[]): Promise<P
     if (st.mtimeMs < limite) continue
     tenuti.push(f)
     // Un piano superpowers già seguito dal suo registro non si mostra due volte.
-    const n = normale(f.percorso)
+    const n = normalizePath(f.percorso)
     if (esclusi.some(x => n.endsWith(x) || x.endsWith(n))) continue
     const testo = await $.fs.read(f.percorso).catch(() => '')
-    const task = taskDaMarkdown(testo)
-    if (task.length) out.push({ nome: `file:${f.percorso}`, titolo: titoloMarkdown(testo, f.percorso), fonte: 'file', task })
+    const task = tasksFromMarkdown(testo)
+    if (task.length) out.push({ nome: `file:${f.percorso}`, titolo: markdownTitle(testo, f.percorso), fonte: 'file', task, percorso: f.percorso })
   }
-  const prima = await fileTracciati($)
-  if (tenuti.length !== prima.length) await salvaTracciati($, tenuti)
-  const sid = await idSessione($)
-  const pt = pianoDaTask(await read($, taskLiberi), sid)
+  const prima = await trackedFiles($)
+  if (tenuti.length !== prima.length) await saveTrackedFiles($, tenuti)
+  const sid = await sessionId($)
+  const pt = planFromTasks(await read($, taskLiberi), sid)
   if (pt) out.push(pt)
-  const pd = pianoDaTodo(await read($, todo), sid)
+  const pd = planFromTodos(await read($, todo), sid)
   if (pd) out.push(pd)
   return out
 }
 
-async function rileggi($: EngineInterface) {
+async function refresh($: EngineInterface) {
   try {
-    const sp = await leggiPiani($)
-    const percorsi = sp.map(x => (x as Piano & { percorso?: string }).percorso ?? '').filter(Boolean)
-    const p: Piano[] = [...sp.map(({ nome, task, fonte, titolo }) => ({ nome, task, fonte, titolo })), ...(await leggiLiberi($, percorsi))]
+    const sp = await readPlans($)
+    const percorsi = sp.map(x => x.percorso ?? '').filter(Boolean)
+    const p: Piano[] = [...sp, ...(await readOtherPlans($, percorsi))]
     await update($, piani, () => p)
     // Il riquadro di avvio resta finché non compare un piano nuovo, o al massimo mezz'ora.
     const av = await read($, avvio)
     if (av && (p.some(x => !av.pianiPrima.includes(x.nome)) || Date.now() - av.quando > MAX_ATTESA_AVVIO)) {
       await update($, avvio, () => null)
     }
-    const nuovi = aggiornaTempi(await read($, tempi), p, Date.now())
+    const nuovi = updateTimings(await read($, tempi), p, Date.now())
     if (nuovi) {
-      const potati = potaTempi(nuovi, MAX_STORICO)
+      const potati = pruneTimings(nuovi, MAX_STORICO)
       await update($, tempi, () => potati)
       await $.store.set(CHIAVE_TEMPI, potati)
     }
@@ -226,90 +276,179 @@ async function rileggi($: EngineInterface) {
     const a: InfoAgente[] = lista.map(x => ({ id: x.id, descrizione: x.description, tipo: x.type, stato: x.status }))
     await update($, agenti, () => a)
   } catch { /* nessun agente */ }
-  await update($, ora, () => Date.now())
+  await update($, ora, () => Date.now()).catch(() => undefined)
 }
 
-const agentiDelTask = (t: TaskPiano, tutti: InfoAgente[]) =>
+const agentsForTask = (t: TaskPiano, tutti: InfoAgente[]) =>
   tutti.filter(a =>
     t.agenti.some(id => a.id === id || a.id.startsWith(id) || id.startsWith(a.id)) ||
     new RegExp(`\\bTask\\s+${t.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(a.descrizione))
 
-function percAgente(a: InfoAgente, att: Attivita | undefined) {
+function agentPercent(a: InfoAgente, att: Attivita | undefined) {
   if (a.stato === 'completed') return 100
   const n = att?.chiamate ?? 0
   return Math.min(95, Math.round((n / CHIAMATE_ATTESE) * 100))
 }
 
-function statoAgente(a: InfoAgente, att: Attivita | undefined, adesso: number) {
-  const parole: Record<string, string> = {
-    pending: 'in avvio', running: 'al lavoro', waiting: 'in attesa', idle: 'inattivo',
-    completed: 'finito', failed: 'fallito', killed: 'fermato',
-  }
-  let s = parole[a.stato] ?? a.stato
+const STATI_AGENTE = ['pending', 'running', 'waiting', 'idle', 'completed', 'failed', 'killed']
+
+function agentStatus(t: ReturnType<typeof translator>, a: InfoAgente, att: Attivita | undefined, adesso: number) {
+  let s = STATI_AGENTE.includes(a.stato) ? t(`agent.${a.stato}` as MessageKey) : a.stato
   if (att) {
-    s += ` · ${att.chiamate} op · ${att.ultimo}`
+    s += ` · ${t('agent.ops', { n: att.chiamate })} · ${att.ultimo}`
     const fermo = adesso - att.quando
-    if (a.stato === 'running' && fermo > FERMO_MS) s += ` · fermo da ${minuti(fermo)}?`
-    else if (a.stato === 'running') s += ` · ${minuti(fermo)} fa`
+    if (a.stato === 'running' && fermo > FERMO_MS) s += ` · ${t('agent.stalled', { t: formatMinutes(fermo) })}`
+    else if (a.stato === 'running') s += ` · ${t('agent.ago', { t: formatMinutes(fermo) })}`
   }
   return s
 }
 
-const coloreAgente = (a: InfoAgente) =>
+const agentColor = (a: InfoAgente) =>
   a.stato === 'failed' || a.stato === 'killed' ? C.errore : a.stato === 'completed' ? C.ok : C.agente
 
 /** Avvia un nuovo piano: sceglie il flusso, prepara il prompt e lo manda alla sessione. */
-async function avviaPiano($: EngineInterface, testo: string, modo: Composer['modo']): Promise<string> {
+async function startPlan($: EngineInterface, testo: string, modo: Composer['modo']): Promise<string> {
   const obiettivo = testo.trim()
-  if (!obiettivo) return 'Scrivi prima l\'obiettivo del piano.'
+  if (!obiettivo) return tr($, 'start.noGoal')
   const sp = await read($, superpowers)
   const via: Avvio['via'] = modo === 'interno' || !sp ? 'interno' : 'superpowers'
   const adesso = Date.now()
-  const percorso = via === 'interno' ? percorsoPiano(obiettivo, adesso) : undefined
-  if (percorso) await traccia($, percorso)
+  const percorso = via === 'interno' ? planPath(obiettivo, adesso) : undefined
+  if (percorso) await trackFile($, percorso)
   const prima = (await read($, piani)).map(p => p.nome)
   await update($, avvio, () => ({ obiettivo, via, quando: adesso, pianiPrima: prima, ...(percorso ? { percorso } : {}) }))
   await update($, composer, c => ({ ...c, aperto: false }))
-  await $.prompt.submit({ text: via === 'superpowers' ? promptSuperpowers(obiettivo) : promptInterno(obiettivo, percorso ?? '') })
-  const nota = modo === 'superpowers' && !sp ? ' (superpowers non trovato)' : ''
-  return via === 'superpowers' ? 'Nuovo piano avviato con superpowers.' : `Nuovo piano avviato con il flusso interno${nota}: ${percorso}`
+  await $.prompt.submit({ text: via === 'superpowers' ? superpowersPrompt(obiettivo) : internalPrompt(obiettivo, percorso ?? '') })
+  const note = modo === 'superpowers' && !sp ? await tr($, 'start.spMissingNote') : ''
+  return via === 'superpowers' ? tr($, 'start.superpowers') : tr($, 'start.internal', { note, path: percorso ?? '' })
+}
+
+// ---------------------------------------------------------------- piano tenuto aggiornato dal modello
+
+const isFinished = (p: Piano) => p.task.every(t => t.fase === 'completo')
+const fileName = (p: string) => normalizePath(p).split('/').pop() ?? ''
+
+/**
+ * Il piano a cui si riferisce un testo (il prompt di un subagente): quello il cui file è citato;
+ * altrimenti, senza testo o senza citazioni, il più recente con un task in corso, poi il più recente non finito.
+ * `citato` dice se il testo lo nomina davvero.
+ */
+async function activePlan($: EngineInterface, testo = ''): Promise<{ piano: Piano; citato: boolean } | undefined> {
+  const conFile = (await read($, piani)).filter(p => p.percorso)
+  const t = normalizePath(testo)
+  const citato = conFile.find(p => {
+    const n = normalizePath(p.percorso ?? '')
+    return t && (t.includes(n) || t.includes(fileName(n)))
+  })
+  if (citato) return { piano: citato, citato: true }
+  const inCorso = conFile.find(p => !isFinished(p) && p.task.some(x => isActivePhase(x.fase)))
+  const aperto = inCorso ?? conFile.find(p => !isFinished(p))
+  return aperto ? { piano: aperto, citato: false } : undefined
+}
+
+/** Il task di un piano nominato in un testo: "Task N" o il titolo intero. */
+function citedTask(p: Piano, testo: string): TaskPiano | undefined {
+  for (const m of testo.matchAll(/\bTask\s+([\w.-]+?)[:.,)]?(?=\s|$)/gi)) {
+    const t = p.task.find(x => x.id.toLowerCase() === (m[1] ?? '').toLowerCase())
+    if (t) return t
+  }
+  const basso = testo.toLowerCase()
+  return p.task.find(x => x.titolo.length >= 12 && !x.titolo.endsWith('…') && basso.includes(x.titolo.toLowerCase()))
+}
+
+/** Direttiva da aggiungere al prompt di un subagente, o undefined se non c'è un piano a cui legarlo. */
+async function directiveFor($: EngineInterface, prompt: string): Promise<string | undefined> {
+  if (prompt.includes('<plan-update>')) return undefined
+  const a = await activePlan($, prompt)
+  if (!a?.piano.percorso) return undefined
+  const task = citedTask(a.piano, prompt)
+  // Un piano non citato vale solo se c'è davvero lavoro in corso.
+  if (!a.citato && !task && !a.piano.task.some(x => isActivePhase(x.fase))) return undefined
+  return subagentDirective(a.piano.percorso, task ? { id: task.id, titolo: task.titolo } : undefined)
+}
+
+/** Esegue il tool `update_plan`: stato del piano o modifiche alle sue checkbox. */
+async function updatePlan($: EngineInterface, input: { file?: string; operations?: Operation[] }): Promise<{ ok: boolean; testo: string }> {
+  const file = input.file?.trim() || (await activePlan($))?.piano.percorso
+  if (!file) return { ok: false, testo: 'No active plan in the panel: give `file`, the path of the plan.' }
+  const prima = await $.fs.read(file).catch(() => undefined)
+  if (prima === undefined) return { ok: false, testo: `Plan file not found: ${file}` }
+  const ops = input.operations ?? []
+  if (ops.length === 0) return { ok: true, testo: `Plan: ${file}\n${planStatus(prima)}` }
+  const r = applyOperations(prima, ops)
+  if (r.testo !== prima) await $.fs.write(file, r.testo)
+  // Il pannello segue il file da subito, se non lo seguiva già.
+  const seguiti = (await read($, piani)).map(p => normalizePath(p.percorso ?? ''))
+  if (!/[\\/]\.superpowers[\\/]/.test(file) && !seguiti.some(n => n && (n.endsWith(normalizePath(file)) || normalizePath(file).endsWith(n)))) {
+    await trackFile($, file)
+  }
+  void refresh($)
+  const righe = [
+    ...r.fatte.map(f => `✓ ${f}`),
+    ...r.errori.map(x => `✗ ${x}`),
+    '',
+    planStatus(r.testo, 30),
+  ]
+  return { ok: r.fatte.length > 0 || r.errori.length === 0, testo: righe.join('\n') }
 }
 
 const faultKey = (surface: string, module: string) => `${surface}:${module}`
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'superpowers-status', description: 'Apre il pannello con piani, task, subagenti e to-do' })
+    const lang = await resolveLang($, options.language).catch(() => FALLBACK)
+    await update($, lingua, () => lang)
+    await $.command.register({ name: 'superpowers-status', description: translate(lang, 'cmd.status.desc') })
     void $.ui.open({ id: PANE, title: TITOLO })
-    await caricaNascosti($)
-    await caricaTempi($)
-    await scartaListaGlobale($).catch(() => undefined)
+    await loadHidden($)
+    await loadTimings($)
+    await dropGlobalList($).catch(() => undefined)
     try {
-      const sp = superpowersDisponibile((await $.command.list()).map(c => c.name))
+      const sp = isSuperpowersAvailable((await $.command.list()).map(c => c.name))
       await update($, superpowers, () => sp)
     } catch { /* senza elenco comandi: flusso interno */ }
-    await $.command.register({ name: 'nuovo-piano', description: 'Avvia un nuovo piano di lavoro (superpowers se c\'è, altrimenti flusso interno)', argumentHint: '<obiettivo>' })
-    await rileggi($)
-    $.clock.every(OGNI_MS, () => { void rileggi($) })
+    await $.tool.register({ name: TOOL_NAME, description: TOOL_DESCRIPTION, inputSchema: TOOL_SCHEMA, isDeferred: false })
+      .catch(err => $.ui.log(`superpowers-status: tool ${TOOL_NAME} not registered: ${String(err)}`))
+    await $.command.register({ name: 'new-plan', description: translate(lang, 'cmd.newPlan.desc'), argumentHint: translate(lang, 'cmd.newPlan.hint') })
+    await refresh($)
+    $.clock.every(OGNI_MS, () => { void refresh($) })
     return next(e)
   })
 
   on('command.run', { command: 'superpowers-status' }, async $ => {
-    await rileggi($)
+    await refresh($)
     await $.ui.open({ id: PANE, title: TITOLO })
-    return { text: 'Pannello Superpowers status aperto.' }
+    return { text: await tr($, 'cmd.status.opened') }
   })
 
-  on('command.run', { command: 'nuovo-piano' }, async ($, e) => {
+  on('command.run', { command: 'new-plan' }, async ($, e) => {
     if (!e.args.trim()) {
       await update($, composer, c => ({ ...c, aperto: true }))
       await $.ui.open({ id: PANE, title: TITOLO, focus: true })
-      return { text: 'Scrivi l\'obiettivo nel pannello Superpowers status.' }
+      return { text: await tr($, 'cmd.newPlan.writeInPanel') }
     }
-    return { text: await avviaPiano($, e.args, (await read($, composer)).modo) }
+    return { text: await startPlan($, e.args, (await read($, composer)).modo) }
   })
 
+  on('tool.run', { tool: 'mcp__superpowers-status__update_plan' }, async ($, e) => {
+    const r = await updatePlan($, e as unknown as { file?: string; operations?: Operation[] })
+    return r.ok ? { result: r.testo } : { deny: r.testo }
+  }).catch(() => ({ deny: 'update_plan could not read or write the plan: edit the checkboxes directly in the file.' }))
+
+  // L'agente principale tiene il piano aggiornato passo per passo.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    if (r.sections.some(x => x.id === 'superpowers-status:plan')) return r
+    return { sections: [...r.sections, { id: 'superpowers-status:plan', text: PLAN_SECTION, scope: 'session' as const }] }
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', async ($, e, next) => {
+    // Ogni subagente riceve la direttiva di spuntare i passi del piano mentre lavora, non alla fine.
+    let chiamata = e
+    if (e.tool === 'Agent') {
+      const extra = await directiveFor($, e.prompt).catch(() => undefined)
+      if (extra) chiamata = { ...e, prompt: e.prompt + extra }
+    }
     const id = e.agentId
     if (id) {
       await update($, attivita, m => ({
@@ -320,7 +459,7 @@ export const register: Register = on => {
       const lista = ((e as unknown as { todos?: { content: string; status: Todo['stato'] }[] }).todos ?? [])
         .map(t => ({ testo: t.content, stato: t.status }))
       await update($, todo, () => lista)
-      void rileggi($)
+      void refresh($)
     }
     if (e.tool === 'TaskUpdate') {
       const u = e as unknown as { taskId: string; subject?: string; description?: string; status?: TaskLibero['stato'] | 'deleted' }
@@ -330,9 +469,9 @@ export const register: Register = on => {
           : l.map(t => (t.id === u.taskId
             ? { ...t, titolo: u.subject ?? t.titolo, descrizione: u.description ?? t.descrizione, stato: (u.status as TaskLibero['stato'] | undefined) ?? t.stato }
             : t)))
-      void rileggi($)
+      void refresh($)
     }
-    const r = await next(e)
+    const r = await next(chiamata)
     // Dopo la chiamata: serve il risultato (id del task, file del piano) o il file già scritto.
     try {
       const out = (r as { result?: unknown; isError?: boolean }).isError ? undefined : (r as { result?: unknown }).result
@@ -341,16 +480,16 @@ export const register: Register = on => {
         const id = (out as { task?: { id?: string } }).task?.id
         if (id) {
           await update($, taskLiberi, l => [...l, { id, titolo: c.subject, descrizione: c.description ?? '', stato: 'pending' as const }])
-          void rileggi($)
+          void refresh($)
         }
       } else if (e.tool === 'ExitPlanMode' && out) {
         const f = (out as { filePath?: string }).filePath
-        if (f) { await traccia($, f); void rileggi($) }
+        if (f) { await trackFile($, f); void refresh($) }
       } else if ((e.tool === 'Write' || e.tool === 'Edit') && out) {
         const f = (e as unknown as { file_path: string }).file_path
-        if (/\.md$/i.test(f) && !/[\\/]\.superpowers[\\/]/.test(f) && haCheckbox(await $.fs.read(f).catch(() => ''))) {
-          await traccia($, f)
-          void rileggi($)
+        if (/\.md$/i.test(f) && !/[\\/]\.superpowers[\\/]/.test(f) && hasCheckboxes(await $.fs.read(f).catch(() => ''))) {
+          await trackFile($, f)
+          void refresh($)
         }
       }
     } catch { /* il tracciamento non deve mai disturbare la chiamata */ }
@@ -374,7 +513,7 @@ export const register: Register = on => {
     const key = faultKey(e.surface, e.module)
     if (e.requestId === PANE && !guasti.has(key)) {
       guasti.add(key)
-      $.ui.log(`superpowers-status: ${e.module} in errore su ${e.surface} (${e.phase}: ${e.reason}); lo disegno senza animazione`)
+      $.ui.log(`superpowers-status: ${e.module} failed on ${e.surface} (${e.phase}: ${e.reason}); drawing it without animation`)
       $.ui.invalidate('ui.render')
     }
     return next(e)
@@ -397,14 +536,21 @@ export const register: Register = on => {
     const esp = await read($, espansi)
     const av = await read($, avvio)
     const sp = await read($, superpowers)
-    const { msPasso, misurati } = ritmo(tmp)
+    const t = translator(await read($, lingua))
+    const phaseLabel = (fase: string) => {
+      const k = phaseKey(fase)
+      return k ? t(k) : fase
+    }
+    const titleOf = (p: Piano) =>
+      p.fonte === 'task' ? t('plan.sessionTasks') : p.fonte === 'todo' ? t('plan.sessionTodos') : (p.titolo ?? p.nome)
+    const { msPasso, misurati } = stepPace(tmp)
     const adesso = (await read($, ora)) || Date.now()
 
     // Larghezza del corpo; dentro un riquadro tolgo bordo e padding.
     const W = Math.max(24, e.props.bodyColumns)
     const dentro = W - 4
 
-    const barra = (key: string, pct: number, width: number, color: string, active: boolean) => {
+    const bar = (key: string, pct: number, width: number, color: string, active: boolean) => {
       const w = Math.max(4, width)
       if (hasBar) {
         return (
@@ -435,15 +581,16 @@ export const register: Register = on => {
 
     // Conto alla rovescia verso `fine`; senza moduli animati, il residuo fermo all'ultima lettura.
     const eta = (key: string, fine: number, color: string, suffix = '') => {
-      if (hasEta) return <els.Client key={key} module="./eta.tsx" props={{ endAt: fine, now: adesso, color, warn: C.correzioni, suffix }} />
+      const over = t('eta.over')
+      if (hasEta) return <els.Client key={key} module="./eta.tsx" props={{ endAt: fine, now: adesso, color, warn: C.correzioni, suffix, over }} />
       const resto = fine - adesso
       return resto >= 0
-        ? <Text color={color}>⏱ {durataBreve(resto)}{suffix}</Text>
-        : <Text color={C.correzioni}>⏱ +{durataBreve(-resto)} oltre stima</Text>
+        ? <Text color={color}>⏱ {shortDuration(resto)}{suffix}</Text>
+        : <Text color={C.correzioni}>⏱ +{shortDuration(-resto)} {over}</Text>
     }
 
     // Riga con testo a sinistra (troncato) e qualcosa fisso a destra.
-    const riga = (sinistra: RenderChildren, destra: RenderChildren | null, width: number) => (
+    const row = (sinistra: RenderChildren, destra: RenderChildren | null, width: number) => (
       <Box width={width} justifyContent="space-between" columnGap={1}>
         <Box flexShrink={1} overflow="hidden">{sinistra}</Box>
         {destra !== null && <Box flexShrink={0}>{destra}</Box>}
@@ -456,12 +603,12 @@ export const register: Register = on => {
 
     const badge = (fase: string) => {
       const col = COLORE_FASE[fase] ?? C.dim
-      return <Text color={col} bold>{faseAttiva(fase) ? `● ${fase}` : fase}</Text>
+      return <Text color={col} bold>{isActivePhase(fase) ? `● ${phaseLabel(fase)}` : phaseLabel(fase)}</Text>
     }
 
-    const rigaAgente = (a: InfoAgente, rientro: number, width: number) => {
+    const agentRow = (a: InfoAgente, rientro: number, width: number) => {
       const at = att[a.id]
-      const col = coloreAgente(a)
+      const col = agentColor(a)
       const finito = a.stato === 'completed'
       const glifo = finito ? '✔' : a.stato === 'failed' || a.stato === 'killed' ? '✗' : '■'
       const w = width - rientro
@@ -473,14 +620,14 @@ export const register: Register = on => {
             <Text color={finito ? C.dim : C.testo} wrap="truncate">{a.descrizione}</Text>
           </Box>
           <Box columnGap={1} marginLeft={2}>
-            {barra(`bar-ag-${a.id}`, percAgente(a, at), barW, col, a.stato === 'running')}
-            <Text color={a.stato === 'failed' ? C.errore : C.dim} wrap="truncate">{statoAgente(a, at, adesso)}</Text>
+            {bar(`bar-ag-${a.id}`, agentPercent(a, at), barW, col, a.stato === 'running')}
+            <Text color={a.stato === 'failed' ? C.errore : C.dim} wrap="truncate">{agentStatus(t, a, at, adesso)}</Text>
           </Box>
         </Box>
       )
     }
 
-    const rigaPasso = (s: { testo: string; fatto: boolean }, corrente: boolean, width: number) => (
+    const stepRow = (s: { testo: string; fatto: boolean }, corrente: boolean, width: number) => (
       <Box columnGap={1} marginLeft={4} width={width - 4}>
         <Text color={s.fatto ? C.ok : corrente ? C.accento : C.tenue} bold={corrente}>
           {s.fatto ? '✔' : corrente ? '▸' : '○'}
@@ -491,11 +638,13 @@ export const register: Register = on => {
       </Box>
     )
 
-    const rigaTask = (p: Piano, t: TaskPiano) => {
+    // Qui `t` è il task: le etichette passano da `tx`.
+    const tx = t
+    const taskRow = (p: Piano, t: TaskPiano) => {
       const ok = t.fase === 'completo'
-      const attivo = faseAttiva(t.fase)
+      const attivo = isActivePhase(t.fase)
       const col = COLORE_FASE[t.fase] ?? C.dim
-      const pt = percTask(t)
+      const pt = taskPercent(t)
       const corrente = t.passi.findIndex(s => !s.fatto)
       // In coda e completati sono una riga; se hanno passi, un clic sul titolo li apre.
       const apribile = !attivo && t.passi.length > 0
@@ -520,37 +669,37 @@ export const register: Register = on => {
         </Box>
       )
       if (!attivo) {
-        const misura = ok ? durata(tmp, p.nome, chiaveDi(t)) : undefined
+        const misura = ok ? measuredDuration(tmp, p.nome, timingKey(t)) : undefined
         const destra = ok
-          ? misura !== undefined ? <Text color={C.tenue}>{durataBreve(misura)}</Text> : null
-          : <Text color={C.tenue}>in coda · ~{durataBreve(stimaTask(t, msPasso))}</Text>
-        if (!aperto) return riga(testa, destra, dentro)
+          ? misura !== undefined ? <Text color={C.tenue}>{shortDuration(misura)}</Text> : null
+          : <Text color={C.tenue}>{tx('task.queued', { t: shortDuration(estimateTask(t, msPasso)) })}</Text>
+        if (!aperto) return row(testa, destra, dentro)
         return (
           <Box flexDirection="column" width={dentro}>
-            {riga(testa, destra, dentro)}
+            {row(testa, destra, dentro)}
             <Text color={C.dim}>
               {'    '}
               {ok
-                ? `${t.passi.length} passi${misura !== undefined ? ` · ${durataBreve(misura)}` : ''}`
-                : `${t.passi.length} passi · stima ~${durataBreve(stimaTask(t, msPasso))}`}
+                ? `${tx('task.steps', { n: t.passi.length })}${misura !== undefined ? ` · ${shortDuration(misura)}` : ''}`
+                : `${tx('task.steps', { n: t.passi.length })} · ${tx('task.estimateApprox', { t: shortDuration(estimateTask(t, msPasso)) })}`}
             </Text>
-            {t.passi.map(s => rigaPasso(s, false, dentro))}
+            {t.passi.map(s => stepRow(s, false, dentro))}
           </Box>
         )
       }
       return (
         <Box flexDirection="column" width={dentro} marginBottom={1}>
-          {riga(testa, badge(t.fase), dentro)}
+          {row(testa, badge(t.fase), dentro)}
           <Box columnGap={1} marginLeft={2}>
-            {barra(`bar-t-${p.nome}-${t.id}`, pt, dentro - 8, col, true)}
+            {bar(`bar-t-${p.nome}-${t.id}`, pt, dentro - 8, col, true)}
             {pct(pt, col)}
           </Box>
           <Box marginLeft={2} columnGap={1}>
-            {eta(`eta-t-${p.nome}-${t.id}`, fineTask(tmp, p.nome, t, msPasso, adesso), C.dim, ' rimasti')}
-            <Text color={C.tenue}>/ stima {durataBreve(stimaTask(t, msPasso))}</Text>
+            {eta(`eta-t-${p.nome}-${t.id}`, taskEnd(tmp, p.nome, t, msPasso, adesso), C.dim, tx('eta.left'))}
+            <Text color={C.tenue}>/ {tx('eta.estimate', { t: shortDuration(estimateTask(t, msPasso)) })}</Text>
           </Box>
-          {(p.fonte ?? 'superpowers') === 'superpowers' && agentiDelTask(t, ags).map(a => rigaAgente(a, 2, dentro))}
-          {t.passi.map((s, i) => rigaPasso(s, i === corrente, dentro))}
+          {(p.fonte ?? 'superpowers') === 'superpowers' && agentsForTask(t, ags).map(a => agentRow(a, 2, dentro))}
+          {t.passi.map((s, i) => stepRow(s, i === corrente, dentro))}
         </Box>
       )
     }
@@ -558,43 +707,43 @@ export const register: Register = on => {
     // Etichetta della fonte del piano, nel colore che la distingue.
     const chip = (f: Fonte | undefined) => {
       const [testo, colore] = ({
-        superpowers: ['SDD', C.accento], task: ['TASK', C.agente], todo: ['TO-DO', C.consegnato], file: ['PIANO', C.revisione],
+        superpowers: ['SDD', C.accento], task: [t('chip.task'), C.agente], todo: [t('chip.todo'), C.consegnato], file: [t('chip.plan'), C.revisione],
       } as Record<Fonte, [string, string]>)[f ?? 'superpowers']
       return <Text color={colore} inverse bold>{` ${testo} `}</Text>
     }
 
-    const pianoFinito = (p: Piano) => p.task.every(t => t.fase === 'completo')
+    const isPlanFinished = (p: Piano) => p.task.every(t => t.fase === 'completo')
 
-    const riquadroPiano = (p: Piano) => {
-      const attivi = p.task.filter(t => faseAttiva(t.fase))
+    const planCard = (p: Piano) => {
+      const attivi = p.task.filter(t => isActivePhase(t.fase))
       const fatti = p.task.filter(t => t.fase === 'completo').length
-      const tot = percPiano(p.task)
-      const finito = pianoFinito(p)
+      const tot = planPercent(p.task)
+      const finito = isPlanFinished(p)
       const col = finito ? C.ok : C.accento
       const isNascosto = hidden.has(p.nome)
       // Un piano finito resta compatto: intestazione, barra e il bottone per toglierlo di mezzo.
       if (finito) {
         return (
           <Box flexDirection="column" borderStyle="round" borderColor={col} borderDimColor paddingX={1} width={W}>
-            {riga(
-              <Box columnGap={1}>{chip(p.fonte)}<Text color={isNascosto ? C.dim : col} bold wrap="truncate">✔ {p.titolo ?? p.nome}</Text></Box>,
-              <Text color={C.dim}>{p.task.length} task</Text>,
+            {row(
+              <Box columnGap={1}>{chip(p.fonte)}<Text color={isNascosto ? C.dim : col} bold wrap="truncate">✔ {titleOf(p)}</Text></Box>,
+              <Text color={C.dim}>{t('plan.tasks', { n: p.task.length })}</Text>,
               dentro,
             )}
             <Box justifyContent="space-between" width={dentro} columnGap={1}>
               <Text color={C.dim}>
-                {isNascosto ? 'nascosto' : 'completato'}
+                {isNascosto ? t('plan.hidden') : t('plan.completed')}
                 {(() => {
-                  const d = p.task.map(t => durata(tmp, p.nome, chiaveDi(t))).filter((x): x is number => x !== undefined)
-                  return d.length ? ` · ${durataBreve(d.reduce((a, b) => a + b, 0))}${d.length < p.task.length ? ' misurati' : ''}` : ''
+                  const d = p.task.map(t => measuredDuration(tmp, p.nome, timingKey(t))).filter((x): x is number => x !== undefined)
+                  return d.length ? ` · ${shortDuration(d.reduce((a, b) => a + b, 0))}${d.length < p.task.length ? t('plan.measured') : ''}` : ''
                 })()}
               </Text>
               <Button
                 key={`toggle-${p.nome}`}
                 plain
                 dimColor
-                label={isNascosto ? '↺ ripristina' : '✕ nascondi'}
-                onPress={() => void impostaNascosti($, l => (isNascosto ? l.filter(x => x !== p.nome) : [...l, p.nome]))}
+                label={isNascosto ? t('btn.restore') : t('btn.hide')}
+                onPress={() => void setHidden($, l => (isNascosto ? l.filter(x => x !== p.nome) : [...l, p.nome]))}
               />
             </Box>
           </Box>
@@ -602,45 +751,45 @@ export const register: Register = on => {
       }
       return (
         <Box flexDirection="column" borderStyle="round" borderColor={col} borderDimColor={attivi.length === 0} paddingX={1} width={W}>
-          {riga(
-            <Box columnGap={1}>{chip(p.fonte)}<Text color={col} bold wrap="truncate">{p.titolo ?? p.nome}</Text></Box>,
+          {row(
+            <Box columnGap={1}>{chip(p.fonte)}<Text color={col} bold wrap="truncate">{titleOf(p)}</Text></Box>,
             <Text>
-              <Text color={C.dim}>{fatti}/{p.task.length} task </Text>
+              <Text color={C.dim}>{t('plan.tasksOf', { done: fatti, n: p.task.length })} </Text>
               {pct(tot, col)}
             </Text>,
             dentro,
           )}
-          {barra(`bar-p-${p.nome}`, tot, dentro, col, attivi.length > 0)}
+          {bar(`bar-p-${p.nome}`, tot, dentro, col, attivi.length > 0)}
           {(() => {
-            const fine = finePiano(tmp, p, msPasso, adesso)
+            const fine = planEnd(tmp, p, msPasso, adesso)
             if (fine === undefined) return null
-            return riga(
+            return row(
               <Box columnGap={1}>
                 <Text color={C.dim}>ETA</Text>
                 {eta(`eta-p-${p.nome}`, fine, col)}
-                <Text color={C.dim}>· fine ~{orario(fine)}</Text>
+                <Text color={C.dim}>· {t('eta.end', { t: clockTime(fine) })}</Text>
               </Box>,
-              <Text color={C.tenue}>{misurati > 0 ? `${durataBreve(msPasso)}/passo · ${misurati} misurati` : 'stima iniziale'}</Text>,
+              <Text color={C.tenue}>{misurati > 0 ? t('eta.perStep', { t: shortDuration(msPasso), n: misurati }) : t('eta.initial')}</Text>,
               dentro,
             )
           })()}
           <Box flexDirection="column" marginTop={1}>
-            {p.task.map(t => rigaTask(p, t))}
+            {p.task.map(t => taskRow(p, t))}
           </Box>
         </Box>
       )
     }
 
     // Subagenti già mostrati sotto un task attivo: gli altri finiscono nel loro riquadro.
-    const mostrati = new Set(ps.filter(p => (p.fonte ?? 'superpowers') === 'superpowers').flatMap(p => p.task.filter(t => faseAttiva(t.fase)).flatMap(t => agentiDelTask(t, ags).map(a => a.id))))
+    const mostrati = new Set(ps.filter(p => (p.fonte ?? 'superpowers') === 'superpowers').flatMap(p => p.task.filter(t => isActivePhase(t.fase)).flatMap(t => agentsForTask(t, ags).map(a => a.id))))
     const altri = ags.filter(a => !mostrati.has(a.id) && a.stato !== 'completed')
     const alLavoro = ags.filter(a => a.stato === 'running').length
 
     // Si nasconde solo ciò che è finito: un piano nascosto che riprende torna in vista da solo.
-    const isNascosto = (p: Piano) => hidden.has(p.nome) && pianoFinito(p)
-    const visibili = ps.filter(p => !isNascosto(p))
-    const nascostiQui = ps.filter(isNascosto)
-    const finitiVisibili = visibili.filter(pianoFinito)
+    const isHiddenPlan = (p: Piano) => hidden.has(p.nome) && isPlanFinished(p)
+    const visibili = ps.filter(p => !isHiddenPlan(p))
+    const nascostiQui = ps.filter(isHiddenPlan)
+    const finitiVisibili = visibili.filter(isPlanFinished)
 
 
     return (
@@ -648,10 +797,10 @@ export const register: Register = on => {
         <Box justifyContent="center" width={W} columnGap={1}>
           <Text color={C.accento} bold>SUPERPOWERS</Text>
           <Text color={C.tenue}>·</Text>
-          <Text color={C.dim}>{visibili.length} {visibili.length === 1 ? 'piano' : 'piani'}</Text>
+          <Text color={C.dim}>{t('head.plans', { n: visibili.length })}</Text>
           <Text color={C.tenue}>·</Text>
           {spinner('spin-head', C.agente, alLavoro > 0, '○')}
-          <Text color={alLavoro > 0 ? C.agente : C.dim}>{alLavoro} al lavoro</Text>
+          <Text color={alLavoro > 0 ? C.agente : C.dim}>{t('head.working', { n: alLavoro })}</Text>
         </Box>
 
         <Box justifyContent="flex-end" width={W} columnGap={2}>
@@ -660,15 +809,15 @@ export const register: Register = on => {
             plain
             dimColor
             hotkey="r"
-            label="↻ aggiorna"
-            onPress={() => void rileggi($).then(() => $.ui.toast('Pannello aggiornato.'))}
+            label={t('btn.refresh')}
+            onPress={() => void refresh($).then(() => $.ui.toast(t('toast.refreshed')))}
           />
           {!comp.aperto && !av && (
             <Button
-              key="nuovo-piano"
+              key="new-plan"
               plain
               hotkey="n"
-              label="＋ nuovo piano"
+              label={t('btn.newPlan')}
               onPress={() => void update($, composer, c => ({ ...c, aperto: true }))}
             />
           )}
@@ -678,11 +827,11 @@ export const register: Register = on => {
           const via = comp.modo === 'interno' || !sp ? 'interno' : 'superpowers'
           const descr = via === 'superpowers'
             ? 'brainstorming → writing-plans → subagent-driven-development'
-            : 'piano in docs/plans con checkbox, eseguito e spuntato passo per passo'
+            : t('composer.internalDesc')
           const prossimo: Record<Composer['modo'], Composer['modo']> = { auto: 'superpowers', superpowers: 'interno', interno: 'auto' }
           return (
             <Box flexDirection="column" borderStyle="round" borderColor={C.accento} paddingX={1} width={W}>
-              {riga(<Text color={C.accento} bold>＋ Nuovo piano di lavoro</Text>, <Text color={C.dim}>Invio per avviare</Text>, dentro)}
+              {row(<Text color={C.accento} bold>{t('composer.title')}</Text>, <Text color={C.dim}>{t('composer.enter')}</Text>, dentro)}
               {'Input' in els ? (
                 // Il campo sta in un contenitore largo quanto il riquadro: il testo va a capo lì dentro e scorre.
                 <Box width={dentro} overflow="hidden" flexDirection="column">
@@ -690,28 +839,28 @@ export const register: Register = on => {
                     key="obiettivo"
                     rows={5}
                     autoFocus
-                    placeholder="Cosa vuoi ottenere?"
-                    submitLabel="avvia"
-                    onSubmit={(v: string) => void avviaPiano($, v, comp.modo).then(t => $.ui.toast(t))}
+                    placeholder={t('composer.placeholder')}
+                    submitLabel={t('composer.submit')}
+                    onSubmit={(v: string) => void startPlan($, v, comp.modo).then(t => $.ui.toast(t))}
                   />
                 </Box>
               ) : (
-                <Text color={C.dim}>Qui non c'è un campo di testo: usa /nuovo-piano &lt;obiettivo&gt;</Text>
+                <Text color={C.dim}>{t('composer.noInput', { hint: t('cmd.newPlan.hint') })}</Text>
               )}
               <Box columnGap={1} marginTop={1} width={dentro}>
                 {chip(via === 'superpowers' ? 'superpowers' : 'file')}
                 <Text color={C.dim} wrap="truncate">{descr}</Text>
               </Box>
-              {comp.modo !== 'interno' && !sp && <Text color={C.correzioni}>superpowers non trovato: uso il flusso interno</Text>}
+              {comp.modo !== 'interno' && !sp && <Text color={C.correzioni}>{t('composer.spMissing')}</Text>}
               <Box justifyContent="space-between" width={dentro} marginTop={1}>
                 <Button
                   key="modo-piano"
                   plain
                   dimColor
-                  label={`flusso: ${comp.modo === 'auto' ? 'automatico' : comp.modo}`}
+                  label={t('composer.flow', { m: t(comp.modo === 'auto' ? 'flow.auto' : comp.modo === 'interno' ? 'flow.interno' : 'flow.superpowers') })}
                   onPress={() => void update($, composer, c => ({ ...c, modo: prossimo[c.modo] }))}
                 />
-                <Button key="annulla-piano" plain dimColor label="✕ annulla" onPress={() => void update($, composer, c => ({ ...c, aperto: false }))} />
+                <Button key="annulla-piano" plain dimColor label={t('btn.cancel')} onPress={() => void update($, composer, c => ({ ...c, aperto: false }))} />
               </Box>
             </Box>
           )
@@ -719,29 +868,29 @@ export const register: Register = on => {
 
         {av && (
           <Box flexDirection="column" borderStyle="round" borderColor={C.revisione} paddingX={1} width={W}>
-            {riga(
+            {row(
               <Box columnGap={1}>
                 {spinner('spin-avvio', C.revisione, true, '◐')}
-                <Text color={C.revisione} bold>Avvio piano</Text>
+                <Text color={C.revisione} bold>{t('launch.title')}</Text>
                 {chip(av.via === 'superpowers' ? 'superpowers' : 'file')}
               </Box>,
               <Button key="chiudi-avvio" plain dimColor label="✕" onPress={() => void update($, avvio, () => null)} />,
               dentro,
             )}
-            <Text wrap="truncate">{corto(av.obiettivo.replace(/\s+/g, ' '), dentro * 2)}</Text>
+            <Text wrap="truncate">{truncate(av.obiettivo.replace(/\s+/g, ' '), dentro * 2)}</Text>
             <Text color={C.dim} wrap="truncate">
-              {av.via === 'superpowers' ? 'in attesa del piano: brainstorming → writing-plans' : `in attesa di ${av.percorso ?? 'il piano'}`}
-              {` · da ${durataBreve(Math.max(1000, adesso - av.quando))}`}
+              {av.via === 'superpowers' ? t('launch.waitingSp') : t('launch.waitingFile', { p: av.percorso ?? t('launch.thePlan') })}
+              {t('launch.since', { t: shortDuration(Math.max(1000, adesso - av.quando)) })}
             </Text>
           </Box>
         )}
 
         {visibili.length === 0 && (
           <Box borderStyle="round" borderColor={C.tenue} paddingX={1} width={W}>
-            <Text color={C.dim}>{ps.length === 0 ? 'Nessun piano superpowers recente in questo progetto.' : 'Tutti i piani recenti sono nascosti.'}</Text>
+            <Text color={C.dim}>{ps.length === 0 ? t('empty.none') : t('empty.allHidden')}</Text>
           </Box>
         )}
-        {visibili.map(riquadroPiano)}
+        {visibili.map(planCard)}
 
         {(nascostiQui.length > 0 || finitiVisibili.length > 1) && (
           <Box justifyContent="flex-end" width={W} columnGap={2}>
@@ -750,8 +899,8 @@ export const register: Register = on => {
                 key="nascondi-finiti"
                 plain
                 hotkey="f"
-                label={`nascondi ${finitiVisibili.length} finiti`}
-                onPress={() => void impostaNascosti($, l => [...new Set([...l, ...finitiVisibili.map(p => p.nome)])])}
+                label={t('btn.hideFinished', { n: finitiVisibili.length })}
+                onPress={() => void setHidden($, l => [...new Set([...l, ...finitiVisibili.map(p => p.nome)])])}
               />
             )}
             {nascostiQui.length > 0 && (
@@ -759,18 +908,18 @@ export const register: Register = on => {
                 key="mostra-nascosti"
                 plain
                 hotkey="h"
-                label={vediNascosti ? 'chiudi nascosti' : `${nascostiQui.length} nascosti`}
+                label={vediNascosti ? t('btn.closeHidden') : t('btn.hiddenCount', { n: nascostiQui.length })}
                 onPress={() => void update($, mostraNascosti, v => !v)}
               />
             )}
           </Box>
         )}
-        {vediNascosti && nascostiQui.map(riquadroPiano)}
+        {vediNascosti && nascostiQui.map(planCard)}
 
         {altri.length > 0 && (
           <Box flexDirection="column" borderStyle="round" borderColor={C.agente} paddingX={1} width={W}>
-            {riga(<Text color={C.agente} bold>Altri subagenti</Text>, <Text color={C.dim}>{altri.length}</Text>, dentro)}
-            {altri.map(a => rigaAgente(a, 0, dentro))}
+            {row(<Text color={C.agente} bold>{t('agents.others')}</Text>, <Text color={C.dim}>{altri.length}</Text>, dentro)}
+            {altri.map(a => agentRow(a, 0, dentro))}
           </Box>
         )}
 

@@ -29,7 +29,7 @@ const Bar: ClientModule<Props, State> = (props, surface) => {
   const giro = pieni + 8
   const testa = ref.active && pieni > 0 ? ref.phase % giro : -1
   const pezzi: { text: string; color: string; bold?: boolean }[] = []
-  const metti = (ch: string, color: string, bold?: boolean) => {
+  const put = (ch: string, color: string, bold?: boolean) => {
     const last = pezzi[pezzi.length - 1]
     if (last && last.color === color && last.bold === bold) last.text += ch
     else pezzi.push({ text: ch, color, bold })
@@ -37,11 +37,11 @@ const Bar: ClientModule<Props, State> = (props, surface) => {
   for (let i = 0; i < w; i++) {
     if (i < pieni) {
       const lit = testa >= 0 && i <= testa && i > testa - RIFLESSO
-      metti('━', lit ? props.shine : props.color, lit || undefined)
+      put('━', lit ? props.shine : props.color, lit || undefined)
     } else if (i === pieni && ref.active) {
-      metti(ref.phase % 6 < 3 ? '╸' : '─', ref.phase % 6 < 3 ? props.color : props.dim)
+      put(ref.phase % 6 < 3 ? '╸' : '─', ref.phase % 6 < 3 ? props.color : props.dim)
     } else {
-      metti('─', props.dim)
+      put('─', props.dim)
     }
   }
   return (

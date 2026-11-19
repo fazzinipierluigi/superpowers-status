@@ -1,6 +1,6 @@
 {
   "name": "superpowers-status",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Live side panel for Claude Code that tracks your project's development: superpowers SDD plans, plan-mode and markdown checklists, tasks and to-dos, with animated progress, per-task and per-plan ETA, subagent activity and a button to start a new work plan",
   "author": {
     "name": "Fazzini Pierluigi",
@@ -20,5 +20,22 @@
     "dashboard",
     "tui"
   ],
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the panel labels. auto follows Claude Code's language setting, then the system locale (English if neither is known).",
+      "default": "auto",
+      "options": [
+        "auto",
+        "it",
+        "en",
+        "es",
+        "de",
+        "fr",
+        "ru"
+      ]
+    }
+  }
 }

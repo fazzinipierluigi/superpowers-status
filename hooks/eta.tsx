@@ -2,7 +2,7 @@
 // `now` arriva dal modulo degli hook; tra un ridisegno e l'altro conta da solo. Oltre la stima diventa `+m:ss`.
 import type { ClientModule } from 'claude-code'
 
-type Props = { endAt: number; now: number; color: string; warn: string; suffix: string }
+type Props = { endAt: number; now: number; color: string; warn: string; suffix: string; over?: string }
 type Ref = { base: number; ticks: number; lastNow: number }
 type State = { ref: Ref }
 
@@ -35,7 +35,7 @@ const Eta: ClientModule<Props, State> = (props, surface) => {
       {props.suffix}
     </Text>
   ) : (
-    <Text color={props.warn}>⏱ +{fmt(-resto)} oltre stima</Text>
+    <Text color={props.warn}>⏱ +{fmt(-resto)} {props.over ?? 'over estimate'}</Text>
   )
 }
 

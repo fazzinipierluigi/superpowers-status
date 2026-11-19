@@ -18,7 +18,7 @@ export type TaskPiano = {
 export type Fonte = 'superpowers' | 'task' | 'todo' | 'file'
 
 /** `nome` è la chiave (tempi, nascosti); `titolo` ciò che si mostra, se diverso. */
-export type Piano = { nome: string; task: TaskPiano[]; fonte?: Fonte; titolo?: string }
+export type Piano = { nome: string; task: TaskPiano[]; fonte?: Fonte; titolo?: string; /** File markdown del piano, se ne ha uno. */ percorso?: string }
 
 /** Un task della lista di Claude Code (TaskCreate / TaskUpdate). */
 export type TaskLibero = { id: string; titolo: string; stato: 'pending' | 'in_progress' | 'completed'; descrizione: string }
@@ -50,6 +50,9 @@ export type Avvio = {
 /** Il riquadro per scrivere un nuovo piano: aperto o no, e quale flusso usare. */
 export type Composer = { aperto: boolean; modo: 'auto' | 'superpowers' | 'interno' }
 
+/** Lingua delle etichette del pannello. */
+export type Lang = 'it' | 'en' | 'es' | 'de' | 'fr' | 'ru'
+
 export type Todo = { testo: string; stato: 'pending' | 'in_progress' | 'completed' }
 
 declare module 'claude-code' {
@@ -74,6 +77,8 @@ declare module 'claude-code' {
       avvio: Shaped<Avvio | null>
       /** Le skill superpowers per il flusso completo ci sono in questa sessione. */
       superpowers: Shaped<boolean>
+      /** Lingua delle etichette: dall'opzione della mod o, in automatico, dalle impostazioni. */
+      lang: Shaped<Lang>
     }
   }
 }
