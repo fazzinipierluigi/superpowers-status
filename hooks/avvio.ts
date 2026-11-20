@@ -76,6 +76,11 @@ export const TOOL_DESCRIPTION = [
   '- rename: `{ task: "3", step: 2, text: "new text" }`.',
   '- add: `{ task: "3", add: "step text" }` (at the end of the task, or after `step`).',
   '`file` is the plan\'s path; when missing, the panel\'s active plan is used.',
+  '',
+  'Rules for everyone, main agent and subagents alike:',
+  '- Tick each step the moment it is done, before starting the next one. Never batch ticks at the end of a task.',
+  '- Always tick the plan the panel reads: the absolute path given in your `<plan-update>` block, in the main checkout. Never tick a copy of the plan inside a git worktree or another directory: the panel does not read it (a worktree path is redirected to the tracked plan).',
+  '- When you dispatch a subagent, give it the absolute path of that plan and its task number; never tell it to tick the plan in its worktree.',
 ].join('\n')
 
 export const TOOL_SCHEMA = {
@@ -107,19 +112,23 @@ export const PLAN_SECTION = [
   'A panel shows the progress of work plans live by reading the checkboxes of their markdown files (superpowers plans, plan mode, `docs/plans/*.md`, any `- [ ]` checklist). When you run such a plan:',
   `- As soon as you complete a step, tick it right away with the \`${PLAN_TOOL}\` tool (or by changing \`- [ ]\` to \`- [x]\` in the file). Never batch the ticks at the end of a task: the panel would stand still.`,
   '- If the plan changes (steps added, split, renamed or dropped), update it with the same tool before going on.',
-  '- When you delegate a task to a subagent, put the plan file\'s path and the task number in its prompt: it ticks the steps itself as it completes them. When it returns, check the plan\'s state and tick whatever is missing.',
+  '- When you delegate a task to a subagent, put the ABSOLUTE path of the plan the panel reads (in the main checkout, not in a worktree) and the task number in its prompt: it ticks the steps itself as it completes them. Never tell a subagent to tick the plan inside its own worktree: the panel would only move at merge time. When it returns, check the plan\'s state and tick whatever is missing.',
 ].join('\n')
 
-/** Directive appended to every subagent's prompt while a plan is in progress. */
+/** Directive appended to every subagent's prompt while a plan is in progress. `path` is absolute. */
 export function subagentDirective(path: string, task?: { id: string; titolo: string }): string {
   const where = task ? `Task ${task.id} ("${task.titolo}") of the plan \`${path}\`` : `the plan \`${path}\``
+  const args = `file: "${path}"${task ? `, task: "${task.id}"` : ''}`
   return [
     '',
     '',
     '<plan-update>',
-    `This work is part of ${where}, whose progress is shown live in a panel.`,
-    `While you work, as soon as you complete each step, tick it RIGHT AWAY with the \`${PLAN_TOOL}\` tool (file: \`${path}\`${task ? `, task: "${task.id}"` : ''}), one step at a time. Do not wait until the end: ticking everything at once when you finish makes the tracking useless.`,
-    `If the tool is not available, edit the file directly, changing \`- [ ]\` to \`- [x]\` on the step's line. If you find new or obsolete steps, update the plan the same way. Only tick the steps of ${task ? 'your task' : 'the work assigned to you'}.`,
+    `MANDATORY. This work is part of ${where}, whose progress is shown live in a panel that reads ONLY that file.`,
+    `1. Each time you complete a step (test written, test passing, code done, commit made...), call \`${PLAN_TOOL}\` with { ${args}, operations: [{ task, step }] } RIGHT AWAY, before starting the next step. One call per step, as you go. Ticking everything at the end, or never, is a failure of this task.`,
+    `2. Use exactly this absolute path: \`${path}\`. This holds even if you work in a git worktree or another directory: do NOT tick, edit or commit the copy of the plan inside your worktree. The panel does not read it and the ticks would only show up at merge time.`,
+    `3. If the tool is not available to you, edit \`${path}\` directly (the absolute path above, not your worktree copy), changing \`- [ ]\` to \`- [x]\` on the step's line.`,
+    `4. If you find new or obsolete steps, update the plan the same way. Only tick the steps of ${task ? 'your task' : 'the work assigned to you'}.`,
+    `5. In your final report, say which steps you ticked.`,
     '</plan-update>',
   ].join('\n')
 }

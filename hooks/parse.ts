@@ -274,3 +274,30 @@ export function planFromTodos(lista: Todo[], sessione: string): Piano | undefine
 
 /** Un testo markdown merita di essere seguito se ha almeno due checkbox. */
 export const hasCheckboxes = (testo: string) => (testo.match(/^\s*[-*]\s+\[( |x|X)\]\s+/gm) ?? []).length >= 2
+
+const isAbsolute = (p: string) => /^([\\/]|[A-Za-z]:[\\/])/.test(p)
+const slash = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+
+/** Percorso assoluto di un piano: un percorso relativo si risolve sulla cwd della sessione. */
+export function absolutePath(cwd: string, percorso: string): string {
+  return isAbsolute(percorso) ? slash(percorso) : `${slash(cwd)}/${slash(percorso).replace(/^\.\//, '')}`
+}
+
+/**
+ * Se `dato` è una copia di un piano seguito (stesso percorso relativo al repository, ma in un'altra
+ * cartella, tipicamente il worktree di un subagente), il percorso del piano seguito; altrimenti undefined.
+ * `seguiti` sono assoluti; `radici` le cartelle (cwd, root del repository) rispetto a cui si misura il relativo.
+ */
+export function trackedCopyOf(dato: string, seguiti: string[], radici: string[]): string | undefined {
+  if (!isAbsolute(dato)) return undefined
+  const d = slash(dato).toLowerCase()
+  if (seguiti.some(s => slash(s).toLowerCase() === d)) return undefined
+  for (const s of seguiti) {
+    const n = slash(s).toLowerCase()
+    const radice = radici.map(r => slash(r).toLowerCase()).filter(r => r && n.startsWith(r + '/')).sort((a, b) => b.length - a.length)[0]
+    if (!radice) continue
+    const rel = n.slice(radice.length)
+    if (d.endsWith(rel)) return slash(s)
+  }
+  return undefined
+}

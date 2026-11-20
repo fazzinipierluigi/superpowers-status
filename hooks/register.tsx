@@ -5,6 +5,7 @@ import type { Attivita, Avvio, Composer, FileTracciato, Fonte, InfoAgente, Lang,
 import {
   updateTimings, applyLedger, ledgerBases, timingKey, measuredDuration, isActivePhase, planEnd, taskEnd, hasCheckboxes, resolveIn, planPercent, taskPercent,
   planFromTasks, planFromTodos, planFromLedger, pruneTimings, stepPace, estimateTask, tasksFromMarkdown, tasksFromPlan, markdownTitle,
+  absolutePath, trackedCopyOf,
 } from './parse'
 import {
   TOOL_DESCRIPTION, TOOL_NAME, TOOL_SCHEMA, PLAN_SECTION, subagentDirective, planPath, internalPrompt, superpowersPrompt,
@@ -364,17 +365,33 @@ async function directiveFor($: EngineInterface, prompt: string): Promise<string 
   const task = citedTask(a.piano, prompt)
   // Un piano non citato vale solo se c'è davvero lavoro in corso.
   if (!a.citato && !task && !a.piano.task.some(x => isActivePhase(x.fase))) return undefined
-  return subagentDirective(a.piano.percorso, task ? { id: task.id, titolo: task.titolo } : undefined)
+  // Percorso assoluto del file che il pannello legge: un subagente in un worktree non deve risolverlo nel suo.
+  const assoluto = absolutePath(await $.session.cwd(), a.piano.percorso)
+  return subagentDirective(assoluto, task ? { id: task.id, titolo: task.titolo } : undefined)
+}
+
+/** Se `file` è una copia di un piano seguito (nel worktree di un subagente o altrove), il piano seguito. */
+async function trackedOriginal($: EngineInterface, file: string): Promise<string | undefined> {
+  const cwd = await $.session.cwd()
+  const repo = await $.session.repo().catch(() => null)
+  const seguiti = (await read($, piani)).map(p => p.percorso).filter((x): x is string => !!x).map(x => absolutePath(cwd, x))
+  return trackedCopyOf(file, seguiti, [cwd, ...(repo?.root ? [repo.root] : [])])
 }
 
 /** Esegue il tool `update_plan`: stato del piano o modifiche alle sue checkbox. */
 async function updatePlan($: EngineInterface, input: { file?: string; operations?: Operation[] }): Promise<{ ok: boolean; testo: string }> {
-  const file = input.file?.trim() || (await activePlan($))?.piano.percorso
-  if (!file) return { ok: false, testo: 'No active plan in the panel: give `file`, the path of the plan.' }
+  const dato = input.file?.trim() || (await activePlan($))?.piano.percorso
+  if (!dato) return { ok: false, testo: 'No active plan in the panel: give `file`, the path of the plan.' }
+  // Una copia del piano in un worktree si aggiorna sul piano che il pannello legge.
+  const originale = await trackedOriginal($, dato).catch(() => undefined)
+  const file = originale ?? dato
+  const nota = originale
+    ? `Note: \`${dato}\` is a copy of the tracked plan. Updated \`${originale}\` instead, the file the panel reads: use that path from now on and leave the copy untouched.`
+    : ''
   const prima = await $.fs.read(file).catch(() => undefined)
   if (prima === undefined) return { ok: false, testo: `Plan file not found: ${file}` }
   const ops = input.operations ?? []
-  if (ops.length === 0) return { ok: true, testo: `Plan: ${file}\n${planStatus(prima)}` }
+  if (ops.length === 0) return { ok: true, testo: [nota, `Plan: ${file}`, planStatus(prima)].filter(Boolean).join('\n') }
   const r = applyOperations(prima, ops)
   if (r.testo !== prima) await $.fs.write(file, r.testo)
   // Il pannello segue il file da subito, se non lo seguiva già.
@@ -384,6 +401,7 @@ async function updatePlan($: EngineInterface, input: { file?: string; operations
   }
   void refresh($)
   const righe = [
+    ...(nota ? [nota, ''] : []),
     ...r.fatte.map(f => `✓ ${f}`),
     ...r.errori.map(x => `✗ ${x}`),
     '',
